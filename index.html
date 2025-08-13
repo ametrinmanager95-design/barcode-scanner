@@ -16,19 +16,22 @@
     const status = document.getElementById('status');
     const btnTorch = document.getElementById('btnTorch');
     const btnClose = document.getElementById('btnClose');
+    const counter = document.getElementById('counter');
 
     const codeReader = new BrowserMultiFormatReader();
-    let lastSent = null;
+    let lastSent = null;   // захист від дублю
     let streamTrack = null;
+    let count = 0;         // лічильник успішних сканів
 
     function setStatus(txt) { status.textContent = txt; }
+    function bumpCounter() { counter.textContent = String(++count); }
 
     async function toggleTorch() {
       try {
         if (!streamTrack) return;
         const caps = streamTrack.getCapabilities?.();
         if (!caps || !caps.torch) {
-          tg?.showAlert('Ліхтарик не підтримується');
+          tg?.showAlert('Ліхтарик не підтримується на цьому пристрої');
           return;
         }
         const constraints = streamTrack.getConstraints?.();
@@ -43,14 +46,11 @@
       try {
         const devices = await navigator.mediaDevices.enumerateDevices();
         const cams = devices.filter(d => d.kind === 'videoinput');
-        if (cams.length === 0) {
-          setStatus('Камеру не знайдено');
-          return;
-        }
+        if (cams.length === 0) { setStatus('Камеру не знайдено'); return; }
         const back = cams.find(c => /back|rear|environment/i.test(c.label));
         const deviceId = (back || cams[0]).deviceId;
 
-        await codeReader.decodeFromVideoDevice(deviceId, video, (result, err) => {
+        await codeReader.decodeFromVideoDevice(deviceId, video, (result, err, controls) => {
           if (!streamTrack && video.srcObject) {
             const tracks = video.srcObject.getVideoTracks();
             if (tracks && tracks[0]) streamTrack = tracks[0];
@@ -60,11 +60,15 @@
             const text = result.getText();
             const format = result.getBarcodeFormat();
             setStatus('✅ Зчитано: ' + text + ' (' + format + ')');
+
             if (text && text !== lastSent) {
-              lastSent = text;
+              lastSent = text;  // анти-дубль в рамках кількох кадрів
               const payload = { format, text, ts: Date.now() };
               try {
                 tg?.sendData(JSON.stringify(payload));
+                bumpCounter();      // ← тепер WebApp НЕ закривається; можна сканувати далі
+                // controls.stop();  // (опціонально) щоб зупинити сканер
+                // codeReader.reset();
               } catch (e) {
                 console.error('sendData error', e);
                 tg?.showAlert('Помилка відправки у бот: ' + e);
@@ -89,9 +93,10 @@
     html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Arial; }
     #wrap { display:flex; flex-direction:column; height:100%; background:#000; }
     #video { width:100%; height:auto; background:#000; }
-    #toolbar { display:flex; gap:8px; padding:8px; justify-content:center; background:#111; }
+    #toolbar { display:flex; gap:8px; padding:8px; justify-content:center; align-items:center; background:#111; color:#fff; }
     button { padding:10px 14px; border-radius:12px; border:0; font-weight:600; }
     #status { color:#fff; padding:12px; text-align:center; }
+    .pill { background:#222; padding:6px 10px; border-radius:999px; }
   </style>
 </head>
 <body>
@@ -99,6 +104,7 @@
     <video id="video" playsinline></video>
     <div id="toolbar">
       <button id="btnTorch">💡 Ліхтарик</button>
+      <span class="pill">Сканів: <strong id="counter">0</strong></span>
       <button id="btnClose">✖ Закрити</button>
     </div>
     <div id="status">Ініціалізація…</div>
