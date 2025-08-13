@@ -3,147 +3,114 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Сканер штрихкоду — Turbo</title>
+  <title>EAN-13 Scanner — Strict</title>
   <meta name="color-scheme" content="dark light" />
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root { --bg:#000; --fg:#fff; --accent:#19A0FF; }
     html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
-    #wrap { position:fixed; inset:0; display:flex; flex-direction:column; padding-bottom: calc(env(safe-area-inset-bottom) + 86px); }
-    #stage { position:relative; flex:1; display:flex; align-items:center; justify-content:center; background:#000; }
-    #video { width:100%; height:100%; object-fit:cover; }
-    #guide { position:absolute; width:min(90vw, 640px); height:min(26vh, 220px); border:3px solid rgba(255,255,255,.85); border-radius:14px; box-shadow:0 0 0 9999px rgba(0,0,0,.45) inset; }
-    #status { position:absolute; left:50%; transform:translateX(-50%); bottom: calc(env(safe-area-inset-bottom) + 110px); background:rgba(0,0,0,.6); padding:10px 14px; border-radius:12px; font-weight:700; font-size:14px; text-align:center; white-space:nowrap; }
-    #toolbar { position:fixed; left:0; right:0; bottom:0; padding:10px calc(12px + env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left)); background:rgba(0,0,0,.6); backdrop-filter: blur(6px); display:flex; gap:10px; align-items:center; }
-    .btn { min-height:48px; border:0; border-radius:14px; font-weight:700; font-size:16px; color:#fff; background:#1e1e1e; padding:12px 14px; }
+    #wrap { position:fixed; inset:0; display:flex; flex-direction:column; }
+    #stage { position:relative; flex:1; background:#000; }
+    #video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    #guide { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); width:min(92vw,720px); height:min(22vh,180px); border:3px solid rgba(255,255,255,.9); border-radius:12px; box-shadow:0 0 0 9999px rgba(0,0,0,.5) inset; }
+    #status { position:absolute; left:50%; transform:translateX(-50%); bottom:20px; background:rgba(0,0,0,.6); padding:10px 14px; border-radius:12px; font-weight:700; font-size:14px; }
+    #toolbar { display:flex; gap:10px; padding:10px; background:rgba(0,0,0,.6); backdrop-filter: blur(6px); }
+    .btn { flex:1; min-height:48px; border:0; border-radius:14px; font-weight:700; font-size:16px; color:#fff; background:#1e1e1e; padding:12px; }
     .btn.primary { background: var(--accent); }
-    .grow { flex:1; }
     .pill { background:#111; padding:8px 12px; border-radius:999px; }
-    #zoomWrap { display:flex; align-items:center; gap:8px; color:#fff; }
-    #zoom { width:160px; }
   </style>
 </head>
 <body>
   <div id="wrap">
     <div id="stage">
       <video id="video" playsinline></video>
-      <div id="guide" aria-hidden="true"></div>
+      <div id="guide"></div>
       <div id="status">Ініціалізація…</div>
     </div>
     <div id="toolbar">
-      <button id="btnTorch" class="btn">💡</button>
-      <div id="zoomWrap"><label for="zoom">🔎</label><input type="range" id="zoom" min="1" max="5" step="0.1" value="1" /></div>
+      <button id="btnTorch" class="btn">💡 Ліхтарик</button>
       <span class="pill">Сканів: <strong id="counter">0</strong></span>
-      <button id="btnPause" class="btn">⏸</button>
-      <button id="btnResume" class="btn primary" disabled>▶</button>
+      <button id="btnClose" class="btn">✖ Закрити</button>
     </div>
   </div>
 
   <script type="module">
+    import { BrowserMultiFormatReader, DecodeHintType, BarcodeFormat, NotFoundException } from "https://cdn.jsdelivr.net/npm/@zxing/library@0.21.2/+esm";
+
     const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
 
     const video   = document.getElementById('video');
-    const status  = document.getElementById('status');
     const guide   = document.getElementById('guide');
+    const status  = document.getElementById('status');
     const counter = document.getElementById('counter');
     const btnTorch= document.getElementById('btnTorch');
-    const btnPause= document.getElementById('btnPause');
-    const btnResume=document.getElementById('btnResume');
-    const zoomRange = document.getElementById('zoom');
+    const btnClose= document.getElementById('btnClose');
 
-    let track = null, stream = null;
-    let total = 0, paused = false;
-    let lastText = null, lastTime = 0;
-    const DUP_WINDOW_MS = 1000; // не дублювати впродовж 1с
+    let track = null; let total = 0; let last = ''; let lastAt = 0;
 
     function setStatus(t){ status.textContent = t; }
     function bump(){ counter.textContent = String(++total); }
 
-    async function startCamera(){
+    async function startCam(){
       const constraints = {
         audio:false,
         video:{ facingMode:{ ideal:'environment' }, width:{ ideal:1920 }, height:{ ideal:1080 }, focusMode:'continuous' }
       };
-      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       video.srcObject = stream; await video.play();
       track = stream.getVideoTracks()[0];
-      setupZoomUI();
-    }
-
-    function getRoiRect(){
-      const vw = video.videoWidth, vh = video.videoHeight; if(!vw||!vh) return null;
-      // проєктуємо розмір guide у координати відео
-      const guideRect = guide.getBoundingClientRect();
-      const videoRect = video.getBoundingClientRect();
-      const xRatio = vw / videoRect.width, yRatio = vh / videoRect.height;
-      const x = Math.max(0, (guideRect.left - videoRect.left) * xRatio);
-      const y = Math.max(0, (guideRect.top  - videoRect.top ) * yRatio);
-      const w = Math.min(vw - x, guideRect.width  * xRatio);
-      const h = Math.min(vh - y, guideRect.height * yRatio);
-      return {x,y,w,h};
     }
 
     async function setTorch(on){
-      try{
-        const caps = track?.getCapabilities?.(); if(!caps?.torch) return false;
-        await track.applyConstraints({ advanced:[{ torch: !!on }] }); return true;
-      }catch{ return false; }
+      try{ const caps = track?.getCapabilities?.(); if(!caps?.torch) return false; await track.applyConstraints({ advanced:[{ torch: !!on }] }); return true; }catch{ return false; }
     }
 
-    function setupZoomUI(){
-      try{
-        const caps = track?.getCapabilities?.();
-        if(caps?.zoom){
-          zoomRange.min = caps.zoom.min ?? 1;
-          zoomRange.max = caps.zoom.max ?? 5;
-          zoomRange.step= caps.zoom.step?? 0.1;
-          zoomRange.value = caps.zoom.min ?? 1;
-          zoomRange.oninput = async (e)=>{
-            try{ await track.applyConstraints({ advanced:[{ zoom: Number(e.target.value) }] }); }catch{}
-          };
-        } else {
-          // якщо zoom не підтримується — ховаємо контрол
-          document.getElementById('zoomWrap').style.display='none';
-        }
-      }catch{ document.getElementById('zoomWrap').style.display='none'; }
+    btnTorch.addEventListener('click', async ()=>{ const cur = track?.getConstraints?.().advanced?.some(a=>a.torch); const ok = await setTorch(!cur); if(!ok) tg?.showAlert('Ліхтарик не підтримується'); });
+    btnClose.addEventListener('click', ()=> tg?.close());
+
+    // ZXing із жорсткими підказками під EAN-13
+    const hints = new Map();
+    hints.set(DecodeHintType.TRY_HARDER, true);
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.EAN_13]);
+    // hints.set(DecodeHintType.ASSUME_GS1, true); // розкоментуйте, якщо коди GS1
+    const reader = new BrowserMultiFormatReader(hints);
+
+    function getRoi(){
+      const vw = video.videoWidth, vh = video.videoHeight; if(!vw||!vh) return null;
+      const guideRect = guide.getBoundingClientRect();
+      const videoRect = video.getBoundingClientRect();
+      const rx = vw / videoRect.width, ry = vh / videoRect.height;
+      const x = Math.max(0, (guideRect.left - videoRect.left) * rx);
+      const y = Math.max(0, (guideRect.top  - videoRect.top ) * ry);
+      const w = Math.min(vw - x, guideRect.width  * rx);
+      const h = Math.min(vh - y, guideRect.height * ry);
+      return { x, y, width:w, height:h };
     }
 
-    btnTorch.addEventListener('click', async ()=>{
-      if(!track) return tg?.showAlert('Камера не готова');
-      const cur = track.getConstraints?.().advanced?.some(a=>a.torch);
-      const ok = await setTorch(!cur); if(!ok) tg?.showAlert('Ліхтарик не підтримується');
-    });
-
-    btnPause.addEventListener('click', ()=>{ paused = true; btnPause.disabled=true; btnResume.disabled=false; setStatus('⏸ Паузa'); });
-    btnResume.addEventListener('click', ()=>{ paused = false; btnPause.disabled=false; btnResume.disabled=true; setStatus('▶ Сканування…'); });
-
-    // === Turbo Path 1: BarcodeDetector (якщо доступний) ===
-    async function runBarcodeDetector(){
-      const formats = ['ean-13','code-128','qr_code']; // звузили для швидкості
-      const det = new window.BarcodeDetector({ formats });
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d', { willReadFrequently:true });
-
+    // Основний цикл: decodeFromConstraints із callback працює швидше за зйомку canvas, але
+    // для жорсткого ROI використаємо проміжний canvas і decodeOnce на вирізці (дає приріст на дрібних кодах)
+    async function loopZXing(){
+      const cv = document.createElement('canvas');
+      const ctx = cv.getContext('2d', { willReadFrequently:true });
       async function tick(){
-        if(!paused && video.readyState >= 2){
-          const roi = getRoiRect();
+        if(video.readyState >= 2){
+          const roi = getRoi();
           if(roi){
-            canvas.width = roi.w; canvas.height = roi.h;
-            ctx.drawImage(video, roi.x, roi.y, roi.w, roi.h, 0, 0, roi.w, roi.h);
-            try {
-              const bitmap = await createImageBitmap(canvas);
-              const codes = await det.detect(bitmap);
-              if(codes && codes.length){
-                const best = codes[0];
-                const text = best.rawValue; const format = best.format || 'unknown';
+            const tw = Math.min(roi.width, 1280); // обмежуємо до ~HD для швидкості
+            const th = Math.max(1, Math.round(roi.height * (tw/roi.width)));
+            cv.width = tw; cv.height = th;
+            ctx.drawImage(video, roi.x, roi.y, roi.width, roi.height, 0, 0, tw, th);
+            try{
+              const result = await reader.decodeFromImage(cv);
+              if(result){
+                const text = result.getText(); const format = result.getBarcodeFormat();
                 const now = Date.now();
-                if(text && (text!==lastText || now-lastTime> DUP_WINDOW_MS)){
-                  lastText=text; lastTime=now;
-                  setStatus(`✅ ${text} (${format})`); bump();
+                if(text && (text !== last || now - lastAt > 1200)){
+                  last = text; lastAt = now; setStatus(`✅ ${text} (${format})`); bump();
                   try{ tg?.sendData(JSON.stringify({ format, text, ts: now })); }catch{}
                 }
               }
-            }catch{ /* ignore */ }
+            }catch(e){ if(!(e instanceof NotFoundException)) console.warn(e); }
           }
         }
         requestAnimationFrame(tick);
@@ -151,34 +118,10 @@
       requestAnimationFrame(tick);
     }
 
-    // === Fallback Path 2: ZXing (із hints та ROI через ImageCapture) ===
-    async function runZXing(){
-      const { BrowserMultiFormatReader, DecodeHintType, BarcodeFormat } = await import('https://cdn.jsdelivr.net/npm/@zxing/library@0.21.2/+esm');
-      const hints = new Map();
-      hints.set(DecodeHintType.TRY_HARDER, true);
-      hints.set(DecodeHintType.POSSIBLE_FORMATS, [ BarcodeFormat.EAN_13, BarcodeFormat.CODE_128, BarcodeFormat.QR_CODE ]);
-      const reader = new BrowserMultiFormatReader(hints);
-
-      try{
-        await reader.decodeFromConstraints({ video: { facingMode:{ ideal:'environment' }, width:{ ideal:1280 }, height:{ ideal:720 } } }, video, (result, err)=>{
-          if(paused) return;
-          if(result){
-            const text = result.getText(); const format = result.getBarcodeFormat();
-            const now = Date.now();
-            if(text && (text!==lastText || now-lastTime> DUP_WINDOW_MS)){
-              lastText=text; lastTime=now; setStatus(`✅ ${text} (${format})`); bump();
-              try{ tg?.sendData(JSON.stringify({ format, text, ts: now })); }catch{}
-            }
-          }
-        });
-        setStatus('▶ Сканування… Наведіть рамку на штрихкод');
-      }catch(e){ setStatus('Помилка ZXing: '+e); }
-    }
-
     async function start(){
-      try{ await startCamera(); }catch(e){ setStatus('Помилка камери: '+e); return; }
-      if('BarcodeDetector' in window){ try{ await runBarcodeDetector(); return; }catch{ /* fallthrough */ } }
-      await runZXing();
+      try{ await startCam(); }catch(e){ setStatus('Помилка камери: '+e); return; }
+      setStatus('▶ Наведіть штрихкод у рамку (EAN‑13)');
+      await loopZXing();
     }
 
     start();
