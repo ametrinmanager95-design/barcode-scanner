@@ -2,112 +2,165 @@
 <html lang="uk">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Сканер штрихкоду</title>
+  <meta name="color-scheme" content="dark light" />
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root { --bg:#000; --fg:#fff; --muted:#aaa; --accent:#19A0FF; }
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #wrap { position:fixed; inset:0; display:flex; flex-direction:column; padding-bottom: calc(env(safe-area-inset-bottom) + 76px); }
+    #stage { position:relative; flex:1; display:flex; align-items:center; justify-content:center; background:#000; }
+    #video { width:100%; height:100%; object-fit:cover; background:#000; }
+
+    /* ROI guide */
+    #guide { position:absolute; width:min(86vw, 560px); aspect-ratio: 1.8/1; border:3px solid rgba(255,255,255,.75); border-radius:14px; box-shadow:0 0 0 9999px rgba(0,0,0,.35) inset; }
+    #status { position:absolute; left:50%; transform:translateX(-50%); bottom: calc(env(safe-area-inset-bottom) + 92px); background:rgba(0,0,0,.6); padding:10px 14px; border-radius:12px; font-weight:600; font-size:14px; text-align:center; white-space:nowrap; }
+
+    /* Toolbar pinned to bottom */
+    #toolbar { position:fixed; left:0; right:0; bottom:0; padding:10px calc(12px + env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left)); background:rgba(0,0,0,.6); backdrop-filter: blur(6px); display:flex; gap:10px; align-items:center; justify-content:space-between; }
+    .btn { flex:1; min-height:48px; border:0; border-radius:14px; font-weight:700; font-size:16px; color:#fff; background:#1e1e1e; padding:12px; }
+    .btn:active { transform: scale(.98); }
+    .btn.primary { background: var(--accent); }
+    .seg { display:flex; gap:8px; flex:2; }
+    .pill { min-width:84px; text-align:center; background:#111; padding:8px 10px; border-radius:999px; font-weight:700; }
+    select { flex:2; min-height:48px; border-radius:12px; border:1px solid #333; background:#111; color:#fff; padding:8px; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="stage">
+      <video id="video" playsinline></video>
+      <div id="guide" aria-hidden="true"></div>
+      <div id="status">Ініціалізація…</div>
+    </div>
+
+    <div id="toolbar">
+      <button id="btnTorch" class="btn">💡 Ліхтарик</button>
+      <div class="seg">
+        <button id="btnPause" class="btn">⏸ Пауза</button>
+        <button id="btnResume" class="btn primary" disabled>▶ Продовжити</button>
+      </div>
+      <span class="pill">Сканів: <strong id="counter">0</strong></span>
+    </div>
+  </div>
+
   <script type="module">
-    import { BrowserMultiFormatReader, NotFoundException } from "https://cdn.jsdelivr.net/npm/@zxing/library@0.21.2/+esm";
+    import {
+      BrowserMultiFormatReader,
+      NotFoundException,
+      DecodeHintType,
+      BarcodeFormat
+    } from "https://cdn.jsdelivr.net/npm/@zxing/library@0.21.2/+esm";
 
-    const tg = window.Telegram?.WebApp;
-    tg?.ready();
-    tg?.expand();
+    const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
 
-    const video = document.getElementById('video');
-    const status = document.getElementById('status');
-    const btnTorch = document.getElementById('btnTorch');
-    const btnClose = document.getElementById('btnClose');
+    // --- DOM refs ---
+    const video   = document.getElementById('video');
+    const status  = document.getElementById('status');
+    const btnTorch= document.getElementById('btnTorch');
+    const btnPause= document.getElementById('btnPause');
+    const btnResume=document.getElementById('btnResume');
     const counter = document.getElementById('counter');
 
-    const codeReader = new BrowserMultiFormatReader();
-    let lastSent = null;   // захист від дублю
+    // --- ZXing reader with strong hints ---
+    const hints = new Map();
+    hints.set(DecodeHintType.TRY_HARDER, true);
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+      BarcodeFormat.EAN_13,
+      BarcodeFormat.EAN_8,
+      BarcodeFormat.UPC_A,
+      BarcodeFormat.CODE_128,
+      BarcodeFormat.CODE_39,
+      BarcodeFormat.ITF,
+      BarcodeFormat.QR_CODE,
+      BarcodeFormat.DATA_MATRIX,
+      BarcodeFormat.PDF_417
+    ]);
+    const reader = new BrowserMultiFormatReader(hints);
+
     let streamTrack = null;
-    let count = 0;         // лічильник успішних сканів
+    let scanningPaused = false;
+    let lastText = null;
+    let lastTime = 0;
+    let totalCount = 0;
+    const DUP_WINDOW_MS = 1200;   // ігнор однакових кадрів впродовж 1.2с
+    const REARM_MS = 5000;        // через 5с той самий код знову приймаємо
 
-    function setStatus(txt) { status.textContent = txt; }
-    function bumpCounter() { counter.textContent = String(++count); }
+    function setStatus(t) { status.textContent = t; }
+    function bumpCounter(){ counter.textContent = String(++totalCount) }
 
-    async function toggleTorch() {
+    async function setTorch(on) {
       try {
-        if (!streamTrack) return;
+        if (!streamTrack) return false;
         const caps = streamTrack.getCapabilities?.();
-        if (!caps || !caps.torch) {
-          tg?.showAlert('Ліхтарик не підтримується на цьому пристрої');
-          return;
-        }
-        const constraints = streamTrack.getConstraints?.();
-        const enabled = constraints?.advanced?.some(c => c.torch);
-        await streamTrack.applyConstraints({ advanced: [{ torch: !enabled }] });
-      } catch (e) {
-        tg?.showAlert('Помилка ліхтарика: ' + e);
-      }
+        if (!caps?.torch) return false;
+        await streamTrack.applyConstraints({ advanced: [{ torch: !!on }] });
+        return true;
+      } catch { return false; }
     }
 
-    async function startScan() {
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const cams = devices.filter(d => d.kind === 'videoinput');
-        if (cams.length === 0) { setStatus('Камеру не знайдено'); return; }
-        const back = cams.find(c => /back|rear|environment/i.test(c.label));
-        const deviceId = (back || cams[0]).deviceId;
+    btnTorch.addEventListener('click', async () => {
+      if (!streamTrack) return tg?.showAlert('Камера ще не готова');
+      const cur = streamTrack.getConstraints?.().advanced?.some(c => c.torch);
+      const ok = await setTorch(!cur);
+      if (!ok) tg?.showAlert('Ліхтарик не підтримується');
+    });
 
-        await codeReader.decodeFromVideoDevice(deviceId, video, (result, err, controls) => {
+    btnPause.addEventListener('click', () => { scanningPaused = true; btnPause.disabled=true; btnResume.disabled=false; setStatus('⏸ Паузa'); });
+    btnResume.addEventListener('click', () => { scanningPaused = false; btnPause.disabled=false; btnResume.disabled=true; setStatus('▶ Сканування...'); });
+
+    async function start() {
+      try {
+        // більш «вибагливі» constraints для кращої картинки на смартфоні
+        const constraints = {
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width:  { ideal: 1280 },
+            height: { ideal: 720 },
+            focusMode: 'continuous'
+          }
+        };
+
+        await reader.decodeFromConstraints(constraints, video, (result, err, controls) => {
           if (!streamTrack && video.srcObject) {
             const tracks = video.srcObject.getVideoTracks();
             if (tracks && tracks[0]) streamTrack = tracks[0];
           }
 
+          if (scanningPaused) return;
+
           if (result) {
             const text = result.getText();
             const format = result.getBarcodeFormat();
-            setStatus('✅ Зчитано: ' + text + ' (' + format + ')');
+            const now = Date.now();
 
-            if (text && text !== lastSent) {
-              lastSent = text;  // анти-дубль в рамках кількох кадрів
-              const payload = { format, text, ts: Date.now() };
-              try {
-                tg?.sendData(JSON.stringify(payload));
-                bumpCounter();      // ← тепер WebApp НЕ закривається; можна сканувати далі
-                // controls.stop();  // (опціонально) щоб зупинити сканер
-                // codeReader.reset();
-              } catch (e) {
-                console.error('sendData error', e);
-                tg?.showAlert('Помилка відправки у бот: ' + e);
-              }
+            // анти‑дубль: той самий текст впродовж короткого вікна ігноруємо
+            const isSame = (text === lastText);
+            const withinDup = (now - lastTime) < DUP_WINDOW_MS;
+            const allowAgain = (now - lastTime) > REARM_MS;
+
+            if (!isSame || (isSame && !withinDup) || (isSame && allowAgain)) {
+              lastText = text; lastTime = now;
+              setStatus(`✅ ${text} (${format})`);
+              bumpCounter();
+              // відправляємо в бот
+              try { tg?.sendData(JSON.stringify({ format, text, ts: now })); } catch {}
             }
           } else if (err && !(err instanceof NotFoundException)) {
+            // інші помилки камери/декодера
             console.warn(err);
           }
         });
 
-        setStatus('Наведiть камеру на штрихкод / QR…');
+        setStatus('▶ Сканування... Наведіть рамку на штрихкод/QR');
       } catch (e) {
         setStatus('Помилка доступу до камери: ' + e);
       }
     }
 
-    btnTorch.addEventListener('click', toggleTorch);
-    btnClose.addEventListener('click', () => tg?.close());
-    startScan();
+    start();
   </script>
-  <style>
-    html, body { height:100%; margin:0; font-family: system-ui, -apple-system, Arial; }
-    #wrap { display:flex; flex-direction:column; height:100%; background:#000; }
-    #video { width:100%; height:auto; background:#000; }
-    #toolbar { display:flex; gap:8px; padding:8px; justify-content:center; align-items:center; background:#111; color:#fff; }
-    button { padding:10px 14px; border-radius:12px; border:0; font-weight:600; }
-    #status { color:#fff; padding:12px; text-align:center; }
-    .pill { background:#222; padding:6px 10px; border-radius:999px; }
-  </style>
-</head>
-<body>
-  <div id="wrap">
-    <video id="video" playsinline></video>
-    <div id="toolbar">
-      <button id="btnTorch">💡 Ліхтарик</button>
-      <span class="pill">Сканів: <strong id="counter">0</strong></span>
-      <button id="btnClose">✖ Закрити</button>
-    </div>
-    <div id="status">Ініціалізація…</div>
-  </div>
 </body>
 </html>
