@@ -2,129 +2,131 @@
 <html lang="uk">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>EAN-13 Scanner — Strict</title>
-  <meta name="color-scheme" content="dark light" />
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no"/>
+  <title>Сканер штрихкодів</title>
   <style>
-    :root { --bg:#000; --fg:#fff; --accent:#19A0FF; }
-    html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
-    #wrap { position:fixed; inset:0; display:flex; flex-direction:column; }
-    #stage { position:relative; flex:1; background:#000; }
-    #video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
-    #guide { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); width:min(92vw,720px); height:min(22vh,180px); border:3px solid rgba(255,255,255,.9); border-radius:12px; box-shadow:0 0 0 9999px rgba(0,0,0,.5) inset; }
-    #status { position:absolute; left:50%; transform:translateX(-50%); bottom:20px; background:rgba(0,0,0,.6); padding:10px 14px; border-radius:12px; font-weight:700; font-size:14px; }
-    #toolbar { display:flex; gap:10px; padding:10px; background:rgba(0,0,0,.6); backdrop-filter: blur(6px); }
-    .btn { flex:1; min-height:48px; border:0; border-radius:14px; font-weight:700; font-size:16px; color:#fff; background:#1e1e1e; padding:12px; }
-    .btn.primary { background: var(--accent); }
-    .pill { background:#111; padding:8px 12px; border-radius:999px; }
+    body{margin:0;font-family:system-ui,Arial,sans-serif;background:#0d0f14;color:#fff}
+    .wrap{display:flex;flex-direction:column;min-height:100vh}
+    header{padding:12px 16px;background:#111826;border-bottom:1px solid #222}
+    h1{font-size:16px;margin:0}
+    .view{position:relative;flex:1;display:flex;align-items:center;justify-content:center}
+    video{width:100%;height:100%;object-fit:cover}
+    .mask{position:absolute;inset:0;box-shadow:inset 0 0 0 9999px rgba(0,0,0,.4),
+          inset 0 0 0 2px rgba(255,255,255,.4);border-radius:16px;margin:24px}
+    .toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);
+           background:#16a34a;padding:10px 14px;border-radius:10px;display:none}
+    .actions{position:fixed;top:12px;right:12px;display:flex;gap:8px}
+    button{appearance:none;border:1px solid #2a2f3a;background:#151a22;color:#fff;
+           padding:8px 10px;border-radius:10px;font-size:14px}
+    button:active{transform:scale(0.98)}
   </style>
 </head>
 <body>
-  <div id="wrap">
-    <div id="stage">
-      <video id="video" playsinline></video>
-      <div id="guide"></div>
-      <div id="status">Ініціалізація…</div>
-    </div>
-    <div id="toolbar">
-      <button id="btnTorch" class="btn">💡 Ліхтарик</button>
-      <span class="pill">Сканів: <strong id="counter">0</strong></span>
-      <button id="btnClose" class="btn">✖ Закрити</button>
-    </div>
+<div class="wrap">
+  <header><h1>Скануйте штрихкод…</h1></header>
+  <div class="view">
+    <video id="video" playsinline muted></video>
+    <div class="mask"></div>
   </div>
+  <div class="actions">
+    <button id="torchBtn" disabled>Ліхтар</button>
+    <button id="flipBtn">Камера</button>
+  </div>
+  <div class="toast" id="toast">Відправлено</div>
+</div>
 
-  <script type="module">
-    import { BrowserMultiFormatReader, DecodeHintType, BarcodeFormat, NotFoundException } from "https://cdn.jsdelivr.net/npm/@zxing/library@0.21.2/+esm";
+<script src="https://unpkg.com/@zxing/library@0.21.3"></script>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+  const tg = window.Telegram?.WebApp;
+  if (tg) tg.expand();
 
-    const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
+  const codeReader = new ZXing.BrowserMultiFormatReader();
+  const video = document.getElementById('video');
+  const toast = document.getElementById('toast');
+  const torchBtn = document.getElementById('torchBtn');
+  const flipBtn = document.getElementById('flipBtn');
 
-    const video   = document.getElementById('video');
-    const guide   = document.getElementById('guide');
-    const status  = document.getElementById('status');
-    const counter = document.getElementById('counter');
-    const btnTorch= document.getElementById('btnTorch');
-    const btnClose= document.getElementById('btnClose');
+  let currentDeviceId = null;
+  let streamTrack = null;
+  let torchOn = false;
+  let busy = false;
 
-    let track = null; let total = 0; let last = ''; let lastAt = 0;
-
-    function setStatus(t){ status.textContent = t; }
-    function bump(){ counter.textContent = String(++total); }
-
-    async function startCam(){
+  async function start(cameraId=null){
+    try{
       const constraints = {
-        audio:false,
-        video:{ facingMode:{ ideal:'environment' }, width:{ ideal:1920 }, height:{ ideal:1080 }, focusMode:'continuous' }
+        audio: false,
+        video: cameraId ? {deviceId: {exact: cameraId}} : {facingMode: {ideal: "environment"}}
       };
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      video.srcObject = stream; await video.play();
-      track = stream.getVideoTracks()[0];
+      video.srcObject = stream;
+      await video.play();
+      streamTrack = stream.getVideoTracks()[0];
+
+      const cap = streamTrack.getCapabilities?.() || {};
+      torchBtn.disabled = !(cap.torch);
+      if (!torchBtn.disabled) torchBtn.textContent = "Ліхтар: викл";
+
+      detectLoop();
+    }catch(e){
+      alert("Доступ до камери не надано або камера недоступна.");
+      console.error(e);
     }
+  }
 
-    async function setTorch(on){
-      try{ const caps = track?.getCapabilities?.(); if(!caps?.torch) return false; await track.applyConstraints({ advanced:[{ torch: !!on }] }); return true; }catch{ return false; }
-    }
-
-    btnTorch.addEventListener('click', async ()=>{ const cur = track?.getConstraints?.().advanced?.some(a=>a.torch); const ok = await setTorch(!cur); if(!ok) tg?.showAlert('Ліхтарик не підтримується'); });
-    btnClose.addEventListener('click', ()=> tg?.close());
-
-    // ZXing із жорсткими підказками під EAN-13
-    const hints = new Map();
-    hints.set(DecodeHintType.TRY_HARDER, true);
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.EAN_13]);
-    // hints.set(DecodeHintType.ASSUME_GS1, true); // розкоментуйте, якщо коди GS1
-    const reader = new BrowserMultiFormatReader(hints);
-
-    function getRoi(){
-      const vw = video.videoWidth, vh = video.videoHeight; if(!vw||!vh) return null;
-      const guideRect = guide.getBoundingClientRect();
-      const videoRect = video.getBoundingClientRect();
-      const rx = vw / videoRect.width, ry = vh / videoRect.height;
-      const x = Math.max(0, (guideRect.left - videoRect.left) * rx);
-      const y = Math.max(0, (guideRect.top  - videoRect.top ) * ry);
-      const w = Math.min(vw - x, guideRect.width  * rx);
-      const h = Math.min(vh - y, guideRect.height * ry);
-      return { x, y, width:w, height:h };
-    }
-
-    // Основний цикл: decodeFromConstraints із callback працює швидше за зйомку canvas, але
-    // для жорсткого ROI використаємо проміжний canvas і decodeOnce на вирізці (дає приріст на дрібних кодах)
-    async function loopZXing(){
-      const cv = document.createElement('canvas');
-      const ctx = cv.getContext('2d', { willReadFrequently:true });
-      async function tick(){
-        if(video.readyState >= 2){
-          const roi = getRoi();
-          if(roi){
-            const tw = Math.min(roi.width, 1280); // обмежуємо до ~HD для швидкості
-            const th = Math.max(1, Math.round(roi.height * (tw/roi.width)));
-            cv.width = tw; cv.height = th;
-            ctx.drawImage(video, roi.x, roi.y, roi.width, roi.height, 0, 0, tw, th);
-            try{
-              const result = await reader.decodeFromImage(cv);
-              if(result){
-                const text = result.getText(); const format = result.getBarcodeFormat();
-                const now = Date.now();
-                if(text && (text !== last || now - lastAt > 1200)){
-                  last = text; lastAt = now; setStatus(`✅ ${text} (${format})`); bump();
-                  try{ tg?.sendData(JSON.stringify({ format, text, ts: now })); }catch{}
-                }
-              }
-            }catch(e){ if(!(e instanceof NotFoundException)) console.warn(e); }
-          }
+  async function detectLoop(){
+    try{
+      const result = await codeReader.decodeOnceFromVideoDevice(undefined, 'video');
+      if (result && result.text && !busy){
+        busy = true;
+        const code = result.text.trim();
+        if (tg){
+          tg.sendData(code);
         }
-        requestAnimationFrame(tick);
+        showToast("Відправлено: " + truncate(code, 40));
+        setTimeout(()=> busy=false, 1200);
       }
-      requestAnimationFrame(tick);
+    }catch(e){
+      if (!busy) requestAnimationFrame(detectLoop);
     }
+  }
 
-    async function start(){
-      try{ await startCam(); }catch(e){ setStatus('Помилка камери: '+e); return; }
-      setStatus('▶ Наведіть штрихкод у рамку (EAN‑13)');
-      await loopZXing();
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.style.display = 'block';
+    setTimeout(()=> toast.style.display='none', 1200);
+  }
+
+  function truncate(s, n){ return s.length>n ? s.slice(0,n-1)+'…' : s; }
+
+  torchBtn.addEventListener('click', async ()=>{
+    if (!streamTrack) return;
+    const cap = streamTrack.getCapabilities?.() || {};
+    if (!cap.torch) return;
+    torchOn = !torchOn;
+    await streamTrack.applyConstraints({advanced: [{torch: torchOn}]});
+    torchBtn.textContent = "Ліхтар: " + (torchOn ? "вкл" : "викл");
+  });
+
+  flipBtn.addEventListener('click', async ()=>{
+    const devices = await codeReader.listVideoInputDevices();
+    if (!devices.length) return;
+    const idx = devices.findIndex(d => d.deviceId === currentDeviceId);
+    const next = devices[(idx+1) % devices.length];
+    currentDeviceId = next.deviceId;
+    if (video.srcObject){
+      video.srcObject.getTracks().forEach(t=>t.stop());
     }
+    await start(currentDeviceId);
+  });
 
-    start();
-  </script>
+  (async ()=>{
+    const devices = await codeReader.listVideoInputDevices();
+    if (devices.length){
+      currentDeviceId = devices[0].deviceId;
+    }
+    await start(currentDeviceId);
+  })();
+</script>
 </body>
 </html>
